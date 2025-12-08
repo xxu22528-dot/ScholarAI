@@ -1,8 +1,10 @@
 import streamlit as st
 import os
 import json
+import asyncio
 from agent import ResearchAgent
 from meeting import MeetingController
+from focus_mode import FocusSession
 from utils.file_utils import extract_text_from_pdf, encode_image_to_base64
 from utils.db_utils import create_session, get_all_sessions, get_session_info, add_message, get_messages, delete_session
 
@@ -92,9 +94,15 @@ if not api_key:
 def render_create_view():
     st.title("✨ 创建新研讨")
     
-    mode = st.radio("选择模式", ["🤖 单模型精读", "👥 组会研讨模式"], horizontal=True)
+    mode = st.radio("选择模式", ["🤖 单模型精读", "👥 组会研讨模式", "🎯 聚焦式对话模式"], horizontal=True)
     
-    title_placeholder = "输入论文标题或研究方向..." if mode == "🤖 单模型精读" else "输入会议议题..."
+    if mode == "🤖 单模型精读":
+        title_placeholder = "输入论文标题或研究方向..."
+    elif mode == "👥 组会研讨模式":
+        title_placeholder = "输入会议议题..."
+    else:
+        title_placeholder = "输入长篇汇报主题..."
+
     title = st.text_input("会话标题", placeholder=title_placeholder)
     
     # --- 组会模式下的专家配置 ---
@@ -135,7 +143,13 @@ def render_create_view():
             st.error("组会模式至少需要 2 位专家")
             return
             
-        session_type = "chat" if mode == "🤖 单模型精读" else "meeting"
+        if mode == "🤖 单模型精读":
+            session_type = "chat"
+        elif mode == "👥 组会研讨模式":
+            session_type = "meeting"
+        else:
+            session_type = "focus"
+
         new_id = create_session(title, session_type)
         
         if mode == "👥 组会研讨模式":
@@ -245,7 +259,91 @@ def render_chat_view(session_id, title):
                     )
 
 # ==========================================
-# 视图 C: 组会模式界面 (支持用户插嘴)
+# 视图 C: 聚焦式对话模式 (Focus Mode)
+# ==========================================
+def render_focus_view(session_id, title):
+    st.title(f"🎯 {title}")
+    
+    # 初始化 Session State
+    if "focus_session" not in st.session_state:
+        st.session_state.focus_session = FocusSession(api_key=api_key, base_url=base_url, model=model_name)
+    
+    focus_agent = st.session_state.focus_session
+    
+    # 显示历史记录
+    history = get_messages(session_id)
+    for msg in history:
+        with st.chat_message(msg["role"]):
+            # 如果是 insights 类型的特殊消息，我们渲染成 expander
+            if msg["role"] == "system_insights":
+                try:
+                    insights = json.loads(msg["content"])
+                    with st.expander("🧠 后台思维发散记录", expanded=False):
+                        for note in insights:
+                            st.markdown(f"**片段 {note.get('id', '?')}**: {note.get('chunk', '')[:50]}...")
+                            st.caption(f"💡 {note.get('note', '')}")
+                except:
+                    pass
+            else:
+                st.write(msg["content"])
+
+    # 输入区域
+    # 为了支持长文本，我们使用 chat_input，但提示用户可以粘贴长文
+    if user_input := st.chat_input("在此粘贴长篇汇报内容..."):
+        # 1. 用户消息上屏
+        with st.chat_message("user"):
+            st.write(user_input)
+        add_message(session_id, "user", user_input)
+        
+        # 2. 处理流程
+        with st.chat_message("assistant"):
+            status_placeholder = st.empty()
+            
+            # 定义回调函数来更新 UI
+            def update_progress(insights):
+                with status_placeholder.container():
+                    with st.expander("🧠 正在进行后台全量思维发散...", expanded=True):
+                        for note in insights:
+                            st.markdown(f"**Thinking on Chunk {note['id']}**: {note['note']}")
+            
+            with st.spinner("👂 正在监听并拆解语义块..."):
+                # 运行异步任务
+                # 注意：Streamlit 中运行 asyncio.run 可能有 event loop 问题
+                # 简单的处理方式是创建一个新的 loop 或者使用 asyncio.run (如果当前不在 loop 中)
+                try:
+                    result = asyncio.run(focus_agent.process_full_input(user_input, progress_callback=update_progress))
+                except RuntimeError:
+                    # 如果已经在 loop 中 (比如某些 streamlit 部署环境)，则使用 create_task 或 await
+                    # 但在这里 standard streamlit run 是同步的，可以直接 run
+                    loop = asyncio.new_event_loop()
+                    asyncio.set_event_loop(loop)
+                    result = loop.run_until_complete(focus_agent.process_full_input(user_input, progress_callback=update_progress))
+                    loop.close()
+
+            # 3. 结果展示
+            # A. 展示 Insights
+            insights = result["insights"]
+            with st.expander("🧠 思维发散完成 (点击查看所有后台笔记)", expanded=False):
+                for note in insights:
+                    st.markdown(f"**片段 {note['id']}**: {note['chunk'][:50]}...")
+                    st.info(f"💡 {note['note']}")
+            
+            # 保存 insights 到历史 (作为特殊系统消息，方便回看)
+            add_message(session_id, "system_insights", json.dumps(insights, ensure_ascii=False))
+
+            # B. 展示 Selected Point
+            st.markdown(f"### 🎯 聚焦切入点")
+            st.markdown(f"> {result['selected_point']}")
+            
+            # C. 展示最终回复
+            st.markdown("### 💬 回应")
+            st.write(result["response"])
+            
+            # 保存回复
+            add_message(session_id, "assistant", result["response"])
+
+# ==========================================
+# 视图 D: 组会模式界面 (支持用户插嘴)
 # ==========================================
 def render_meeting_view(session_id, title):
     st.title(f"👥 {title}")
@@ -343,6 +441,8 @@ else:
     if session_info:
         if session_info["session_type"] == "chat":
             render_chat_view(session_info["session_id"], session_info["title"])
+        elif session_info["session_type"] == "focus":
+            render_focus_view(session_info["session_id"], session_info["title"])
         else:
             render_meeting_view(session_info["session_id"], session_info["title"])
     else:
